@@ -441,7 +441,7 @@ loop:
 
 DeltaFIFO可以分开理解为Delta和FIFO两个结构体，其中FIFO是一个先进先出的队列，实现了队列的基本操作，Pop,Add等等，而Delta是一个资源对象存储,可以保存资源对象的操作类型，比如说Add，Update，Sync等等。DeltaFIFO与其他队列不同的地方在于，会保留所有关于资源对象（object）的操作类型，队列中会存在拥有不同操作类型的同一个资源对象，queue字段存储资源对象的key，而items则是一个map数据结构，其中key为资源对象，而value存储了对象的数组。
 
-![image-20211216142521855](/Users/jing/Library/Application Support/typora-user-images/image-20211216142521855.png)
+![image-20211216142521855](https://github.com/JING21/K8S/raw/main/client-go/DeltaFIFO.png)
 
 ```go
 type DeltaFIFO struct {
