@@ -6,7 +6,7 @@
 
 Kubernetes的其他组件通过informer机制与Kubernetes API Server进行交互通信，保证了消息的实时性，可靠性，顺序性。Informer机制架构如图所示：
 
-![Informer](/Users/jing/Downloads/Informer.jpg)
+![Informer](https://github.com/JING21/K8S/raw/main/client-go/Informer.jpg)
 
 ### Reflector组件
 
