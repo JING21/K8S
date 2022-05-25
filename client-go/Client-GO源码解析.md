@@ -1,6 +1,6 @@
-
-
 # Client-GO源码解析
+
+[toc]
 
 ## Informer机制
 
@@ -15,6 +15,10 @@ Reflector组件用于监控（List and Watch）指定的Kubernetes资源，当�
 其中reflector的结构体定义如下所示：
 
 name表示reflector的唯一标识（通过file:line），expectedTypeName, expectedType, expectedGVK(确认资源类型)，store（存储interface，reflector中的具体实现为DeltaQueue），ListWatcher （用于存储ListWatcher的资源），backoffManager，initConnBackoffManager（用于作用于失败重试，当上游apiserver not healthy时，减轻对apiserver的访问，控制流量），resyncPeriod（informer使用者重新同步的周期），ShouldResync,clock（判断是否满足可以重新同步的条件，paginatedResult（是否强制进行分页List），lastSyncResourceVersion（最后同步的资源版本号，watch只会监听大于此值的资源），isLastSyncResourceVersionUnavailable（最后同步的资源版本号是否可用），lastSyncResourceVersionMutex（最后同步的资源版本号的控制锁），WatchListPageSize（ListWatch分页大小），watchErrorHandler（watch失败回调处理handler）
+
+
+
+k8s.io/client-go/tools/cache/reflector.go
 
 ```go
 // Reflector watches a specified resource and causes all changes to be reflected in the given store.
@@ -79,6 +83,8 @@ type Reflector struct {
 
 通过NewReflector()创建一个Reflector，同时传入一个ListWatcher对象和指定的expectedType，存储数据的store的DeltaQueue，重新同步的时间resyncPeriod
 
+k8s.io/client-go/tools/cache/reflector.go
+
 ```go
 func NewReflector(lw ListerWatcher, expectedType interface{}, store Store, resyncPeriod time.Duration) *Reflector {
 	return NewNamedReflector(naming.GetNameFromCallsite(internalPackages...), lw, expectedType, store, resyncPeriod)
@@ -129,6 +135,8 @@ func (r *Reflector) setExpectedType(expectedType interface{}) {
 
 reflector实例对象通过Run函数启动，在stopChannel不结束的情况下，会不停的运行调用reflector实现的listwatch方法去监听APIServer的资源，其中reflector核心关键的代码是ListWatch的实现和watchhandler的实现。
 
+k8s.io/client-go/tools/cache/reflector.go
+
 ```go
 func (r *Reflector) Run(stopCh <-chan struct{}) {
 	klog.V(3).Infof("Starting reflector %s (%s) from %s", r.expectedTypeName, r.resyncPeriod, r.name)
@@ -145,9 +153,11 @@ ListAndWatch的具体流程包含以下几个函数，首先调用一个goroutin
 
 paginatedResult返回结果为true以及resourcesVersion为0时，表示watchCache处于disable的状态同时，同时有多个同一已知类型的object对象，此时表明不需要从watch cache list对象了。（这只会发生在初始化init list的时候），设置这个判断逻辑的原因，是因为我们有时候会设置options，将resourcesVersion设置为空" ",表示直接从etcd list对象。
 
-然后meta.ListAccessor()将list结果转换为listMetaInterface,接着使用listMetaInterface.GetResourceVersion来获取资源版本号，紧接着使用meta.ExtractList()将资源数据转换为资源对象列表items，然后使用r.syncWith(items, resourceVersion)将资源对象列表和资源版本号存储至DeltaFIFO中，替换已存在的对象，最后使用r.setLastSyncResourceVersion(resourceVersion)更新设置最新的版本号。
+然后meta.ListAccessor()将list结果转换为listMetaInterface,接着使用listMetaInterface.GetResourceVersion来获取资源版本号，紧接着使用meta.ExtractList()将资源数据转换为资源对象列表items，然后使用r.syncWith(items, resourceVersion)将资源对象列表和资源版本号存储至DeltaFIFO中，全量替换本地缓存的对象，最后使用r.setLastSyncResourceVersion(resourceVersion)更新设置最新的版本号。
 
 第二个goroutine调用了r.store.Resync()方法，当r.ShouldResync == nil 或者r.ShouldResync()为true的情况下，会重新同步DeltaFIFO的object。
+
+k8s.io/client-go/tools/cache/reflector.go
 
 ```go
 // ListAndWatch first lists all items and get the resource version at the moment of call,
@@ -296,6 +306,8 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 
 最后Watch操作通过HTTP协议与Kubernetes API Server建立长链接，接收Kubernetes API Server发来的资源变更事件。具体调用函数r.listerWatcher.Watch(options)，实际调用了具体Informer下的Watch函数，比如说pod informer的client.CoreV1().Pods(namespace).Watch，r.WatchHandler()用于处理资源变更事件，将对应的资源更新到本地的DeltaFIFO中，并更新其资源版本号ResourceVersion
 
+k8s.io/client-go/tools/cache/reflector.go
+
 ```go
 
 	for {
@@ -439,7 +451,11 @@ loop:
 
 ### DeltaFIFO组件
 
-DeltaFIFO可以分开理解为Delta和FIFO两个结构体，其中FIFO是一个先进先出的队列，实现了队列的基本操作，Pop,Add等等，而Delta是一个资源对象存储,可以保存资源对象的操作类型，比如说Add，Update，Sync等等。DeltaFIFO与其他队列不同的地方在于，会保留所有关于资源对象（object）的操作类型，队列中会存在拥有不同操作类型的同一个资源对象，queue字段存储资源对象的key，而items则是一个map数据结构，其中key为资源对象，而value存储了对象的数组。
+DeltaFIFO可以分开理解为Delta和FIFO两个结构体，其中FIFO是一个先进先出的队列，实现了队列的基本操作，Pop,Add等等，而Delta是一个资源对象存储,可以保存资源对象的操作类型，比如说Add，Update，Sync等等。
+
+DeltaFIFO与其他队列不同的地方在于，会保留所有关于资源对象（object）的操作类型，队列中会存在拥有不同操作类型的同一个资源对象，queue字段存储资源对象的key，而items则是一个map数据结构，其中key为资源对象，而value存储了对象的数组。
+
+k8s.io/client-go/tools/cache/delta_fifo.go
 
 ![image-20211216142521855](https://github.com/JING21/K8S/raw/main/client-go/DeltaFIFO.png)
 
@@ -482,5 +498,683 @@ type DeltaFIFO struct {
 }
 ```
 
+#### 生产者方法
+
+DeltaFIFO本质上是一个先进先出的队列，拥有生产者和消费者，而生产者是Reflector调用add方法，而消费者是controller调用pop方法, add核心方法queueActionLocked()，
+
+- 首先通过f.KeyOf()函数将传入的obeject解析计算出map的key值id
+- 通过ID取到对应的item map中的value值 oldDeltas
+- 将传入的obeject和对应的actionType构建为新的Delta元素添加至老的oldDeltas上，成为新的newDeltas，然后使用dedupDeltas()函数对其进行去重操作
+- 当obejectID对应不存在时，在队列中添加该id，否则就更新item这个map中对应key值为id的value值，并广播通知所有消费者解除阻塞
+
+k8s.io/client-go/tools/cache/delta_fifo.go
+
+```go
+// queueActionLocked appends to the delta list for the object.
+// Caller must lock first.
+func (f *DeltaFIFO) queueActionLocked(actionType DeltaType, obj interface{}) error {
+	id, err := f.KeyOf(obj)
+	if err != nil {
+		return KeyError{obj, err}
+	}
+	oldDeltas := f.items[id]
+	newDeltas := append(oldDeltas, Delta{actionType, obj})
+	newDeltas = dedupDeltas(newDeltas)
+
+	if len(newDeltas) > 0 {
+		if _, exists := f.items[id]; !exists {
+			f.queue = append(f.queue, id)
+		}
+		f.items[id] = newDeltas
+		f.cond.Broadcast()
+	} else {
+		// This never happens, because dedupDeltas never returns an empty list
+		// when given a non-empty list (as it is here).
+		// If somehow it happens anyway, deal with it but complain.
+		if oldDeltas == nil {
+			klog.Errorf("Impossible dedupDeltas for id=%q: oldDeltas=%#+v, obj=%#+v; ignoring", id, oldDeltas, obj)
+			return nil
+		}
+		klog.Errorf("Impossible dedupDeltas for id=%q: oldDeltas=%#+v, obj=%#+v; breaking invariant by storing empty Deltas", id, oldDeltas, obj)
+		f.items[id] = newDeltas
+		return fmt.Errorf("Impossible dedupDeltas for id=%q: oldDeltas=%#+v, obj=%#+v; broke DeltaFIFO invariant by storing empty Deltas", id, oldDeltas, obj)
+	}
+	return nil
+}
+```
+
+#### 消费者方法
+
+Pop()方法由消费者调用，从DeltaFIFO头部中取出最早进入队列的资源数据对象，需要传入PopProcessFunc函数，用于接收并处理对象的回调方法。
+
+当队列为空时，f.cond.Wait()阻塞等待数据，只有收到f.cond.Broadcast()消息之后说明有数据被添加了，会解除阻塞状态，取出f.queue的头部函数，将obeject对象传入processFunc，由上层的消费者处理，如果processFunc处理出错，则会将对象重新存入队列中
+
+```go
+// Pop blocks until the queue has some items, and then returns one.  If
+// multiple items are ready, they are returned in the order in which they were
+// added/updated. The item is removed from the queue (and the store) before it
+// is returned, so if you don't successfully process it, you need to add it back
+// with AddIfNotPresent().
+// process function is called under lock, so it is safe to update data structures
+// in it that need to be in sync with the queue (e.g. knownKeys). The PopProcessFunc
+// may return an instance of ErrRequeue with a nested error to indicate the current
+// item should be requeued (equivalent to calling AddIfNotPresent under the lock).
+// process should avoid expensive I/O operation so that other queue operations, i.e.
+// Add() and Get(), won't be blocked for too long.
+//
+// Pop returns a 'Deltas', which has a complete list of all the things
+// that happened to the object (deltas) while it was sitting in the queue.
+func (f *DeltaFIFO) Pop(process PopProcessFunc) (interface{}, error) {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	for {
+		for len(f.queue) == 0 {
+			// When the queue is empty, invocation of Pop() is blocked until new item is enqueued.
+			// When Close() is called, the f.closed is set and the condition is broadcasted.
+			// Which causes this loop to continue and return from the Pop().
+			if f.closed {
+				return nil, ErrFIFOClosed
+			}
+
+			f.cond.Wait()
+		}
+		id := f.queue[0]
+		f.queue = f.queue[1:]
+		depth := len(f.queue)
+		if f.initialPopulationCount > 0 {
+			f.initialPopulationCount--
+		}
+		item, ok := f.items[id]
+		if !ok {
+			// This should never happen
+			klog.Errorf("Inconceivable! %q was in f.queue but not f.items; ignoring.", id)
+			continue
+		}
+		delete(f.items, id)
+		// Only log traces if the queue depth is greater than 10 and it takes more than
+		// 100 milliseconds to process one item from the queue.
+		// Queue depth never goes high because processing an item is locking the queue,
+		// and new items can't be added until processing finish.
+		// https://github.com/kubernetes/kubernetes/issues/103789
+		if depth > 10 {
+			trace := utiltrace.New("DeltaFIFO Pop Process",
+				utiltrace.Field{Key: "ID", Value: id},
+				utiltrace.Field{Key: "Depth", Value: depth},
+				utiltrace.Field{Key: "Reason", Value: "slow event handlers blocking the queue"})
+			defer trace.LogIfLong(100 * time.Millisecond)
+		}
+		err := process(item)
+		if e, ok := err.(ErrRequeue); ok {
+			f.addIfNotPresent(id, item)
+			err = e.Err
+		}
+		// Don't need to copyDeltas here, because we're transferring
+		// ownership to the caller.
+		return item, err
+	}
+}
+```
+
+HandleDeltas()函数作为process的回调函数，当资源对象的操作类型为Added，Updated，Deleted时，将资源对象存储到Indexer中,并通过distribute函数将资源对象分发至SharedInformer，比如说分发给informer.AddEvenetHandler函数对资源时间进行处理的函数中进行处理。
+
+k8s.io/client-go/tools/cache/shared_informer.go
+
+```go
+func (s *sharedIndexInformer) HandleDeltas(obj interface{}) error {
+	s.blockDeltas.Lock()
+	defer s.blockDeltas.Unlock()
+
+	// from oldest to newest
+	for _, d := range obj.(Deltas) {
+		switch d.Type {
+		case Sync, Replaced, Added, Updated:
+			s.cacheMutationDetector.AddObject(d.Object)
+			if old, exists, err := s.indexer.Get(d.Object); err == nil && exists {
+				if err := s.indexer.Update(d.Object); err != nil {
+					return err
+				}
+
+				isSync := false
+				switch {
+				case d.Type == Sync:
+					// Sync events are only propagated to listeners that requested resync
+					isSync = true
+				case d.Type == Replaced:
+					if accessor, err := meta.Accessor(d.Object); err == nil {
+						if oldAccessor, err := meta.Accessor(old); err == nil {
+							// Replaced events that didn't change resourceVersion are treated as resync events
+							// and only propagated to listeners that requested resync
+							isSync = accessor.GetResourceVersion() == oldAccessor.GetResourceVersion()
+						}
+					}
+				}
+				s.processor.distribute(updateNotification{oldObj: old, newObj: d.Object}, isSync)
+			} else {
+				if err := s.indexer.Add(d.Object); err != nil {
+					return err
+				}
+				s.processor.distribute(addNotification{newObj: d.Object}, false)
+			}
+		case Deleted:
+			if err := s.indexer.Delete(d.Object); err != nil {
+				return err
+			}
+			s.processor.distribute(deleteNotification{oldObj: d.Object}, false)
+		}
+	}
+	return nil
+}
+```
+
+#### Resync机制
+
+Resync机制将会把资源对象从本地存储Indexer同步到DeltaFIFO中，并将这些资源对象设置为Sync操作类型。Resync函数在Reflector中定期执行，执行周期由NewReflector中的resyncPeriod决定。具体代码实现如下，f.knowObjects.
+
+```go
+func (f *DeltaFIFO) syncKeyLocked(key string) error {
+	obj, exists, err := f.knownObjects.GetByKey(key)
+	if err != nil {
+		klog.Errorf("Unexpected error %v during lookup of key %v, unable to queue object for sync", err, key)
+		return nil
+	} else if !exists {
+		klog.Infof("Key %v does not exist in known objects store, unable to queue object for sync", key)
+		return nil
+	}
+
+	// If we are doing Resync() and there is already an event queued for that object,
+	// we ignore the Resync for it. This is to avoid the race, in which the resync
+	// comes with the previous value of object (since queueing an event for the object
+	// doesn't trigger changing the underlying store <knownObjects>.
+	id, err := f.KeyOf(obj)
+	if err != nil {
+		return KeyError{obj, err}
+	}
+	if len(f.items[id]) > 0 {
+		return nil
+	}
+
+	if err := f.queueActionLocked(Sync, obj); err != nil {
+		return fmt.Errorf("couldn't queue object: %v", err)
+	}
+	return nil
+}
+```
+
+### Indexer
+
+Indexer是client-go用于存储资源对象，并自带索引功能的本地存储，Reflector将从DeltaFIFO中消费出来的资源对象存储至Indexer。Indexer中的数据与Etcd集群中的数据保持完全一致，从而可以避免每次从远程的Etcd集群中读取数据，这样可以减轻Apiserver和Etcd的压力
+
+indexer=>Store=>cache(实现了Store接口)=>ThreadSafeStore 
+
+以下为index的关键4个数据结构
+
+ k8s.io/client-go/tools/cache/indexer.go
+
+```go
+// 用于计算一个对象的索引键集合
+type IndexFunc func(obj interface{}) ([]string, error)
+
+// 索引键与对象键集合的映射
+type Index map[string]sets.String
+
+// 索引器名称（或者索引分类）与 IndexFunc 的映射，相当于存储索引的各种分类
+type Indexers map[string]IndexFunc
+
+// 索引器名称与 Index 索引的映射
+type Indices map[string]Index
+```
+
+```go
+package main
+
+import (
+	"fmt"
+	"strings"
+
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/cache"
+)
+
+func  UsersIndexFunc(obj interface{}) ([]string, error)  {
+	pod := obj.(*v1.Pod)
+	userString := pod.Annotations["users"]
 
 
+	return strings.Split(userString, ","), nil
+}
+
+
+func main(){
+	index := cache.NewIndexer(cache.MetaNamespaceKeyFunc,cache.Indexers{"byUser":UsersIndexFunc})
+
+
+	pod1 := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "one", Annotation: map[string]string{"users": "ernie,bert"}}}
+
+	pod2 := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "two", Annotation: map[string]string{"users": "bert,oscar"}}}
+
+	pod3 := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "three", Annotation: map[string]string{"users": "ernie, telsa"}}}
+
+
+	index.Add(pod1)
+	index.Add(pod2)
+	index.Add(pod3)
+
+	erniePods, err := index.ByIndex("byUser", "ernie")
+	if err != nil{
+		panic(err)
+	}
+	
+	for _, v := range erniePods{
+
+		fmt.Println(v.(*v1.Pod).Name)
+	}
+
+}
+```
+
+![image-20220525152754978](https://github.com/JING21/K8S/raw/main/client-go/index.png)
+
+
+
+- IndexFunc：索引器函数，用于计算一个资源对象的索引值列表，上面示例是指定Annotation为索引值结果，当然我们也可以根据需求定义其他的，比如根据 Label 标签、Annotation 等属性来生成索引值列表。
+- Index：存储数据，对于上面的示例，我们要查找某个Annotation下面的 Pod，那就要让 Pod 按照其命名空间进行索引，对应的 Index 类型就是 `map[Annotation]sets.pod`。
+- Indexers：存储索引器，key 为索引器名称，value 为索引器的实现函数，上面的示例就是 `map["byUser"]MetaNamespaceIndexFunc`。
+- Indices：存储缓存器，key 为索引器名称，value 为缓存的数据，对于上面的示例就是 `map["byUser"]map["ernie"]sets.pod`。
+
+```json
+// Indexers 就是包含的所有索引器(分类)以及对应实现
+Indexers: {  
+  "byUser": UsersIndexFunc,
+}
+// Indices 就是包含的所有索引分类中所有的索引数据
+Indices: {
+ "byUser": {  //namespace 这个索引分类下的所有索引数据
+  "ernie": ["pod-1", "pod-2"],  // Index 就是一个索引键下所有的对象键列表
+  "telsa": ["pod-3"]   // Index
+ }
+}
+```
+
+ThreadSafeMap的接口如下所示，以下threadSafeMap具体实现了该ThreadSafeMap接口，可以看到threadSafeMap具体包含了indexers和indices两个具体结构
+
+```go
+type ThreadSafeStore interface {
+	Add(key string, obj interface{})
+	Update(key string, obj interface{})
+	Delete(key string)
+	Get(key string) (item interface{}, exists bool)
+	List() []interface{}
+	ListKeys() []string
+	Replace(map[string]interface{}, string)
+	Index(indexName string, obj interface{}) ([]interface{}, error)
+	IndexKeys(indexName, indexKey string) ([]string, error)
+	ListIndexFuncValues(name string) []string
+	ByIndex(indexName, indexKey string) ([]interface{}, error)
+	GetIndexers() Indexers
+
+	// AddIndexers adds more indexers to this store.  If you call this after you already have data
+	// in the store, the results are undefined.
+	AddIndexers(newIndexers Indexers) error
+	// Resync is a no-op and is deprecated
+	Resync() error
+}
+
+type threadSafeMap struct {
+	lock  sync.RWMutex
+	items map[string]interface{}
+
+	// indexers maps a name to an IndexFunc
+	indexers Indexers
+	// indices maps a name to an Index
+	indices Indices
+}
+```
+
+threadSafeMap结构体实现了store接口的必要的方法，比如说Add,Update,Delete,Get等，其中最关键的函数为updateIndices(),根据indexer,获取对应存储索引器的名称和他对应的索引函数，当需要创建时仅需传入新的对象数据，而删除时仅需传入老的对象数据，而更新时则需要同时传入新旧两个对象数据，当oldObj不为空时，需要根据获取的索引函数计算出实际的老的索引值
+
+```go
+// updateIndices modifies the objects location in the managed indexes:
+// - for create you must provide only the newObj
+// - for update you must provide both the oldObj and the newObj
+// - for delete you must provide only the oldObj
+// updateIndices must be called from a function that already has a lock on the cache
+func (c *threadSafeMap) updateIndices(oldObj interface{}, newObj interface{}, key string) {
+	var oldIndexValues, indexValues []string
+	var err error
+	for name, indexFunc := range c.indexers {
+		if oldObj != nil {
+			oldIndexValues, err = indexFunc(oldObj)
+		} else {
+			oldIndexValues = oldIndexValues[:0]
+		}
+		if err != nil {
+			panic(fmt.Errorf("unable to calculate an index entry for key %q on index %q: %v", key, name, err))
+		}
+
+		if newObj != nil {
+			indexValues, err = indexFunc(newObj)
+		} else {
+			indexValues = indexValues[:0]
+		}
+		if err != nil {
+			panic(fmt.Errorf("unable to calculate an index entry for key %q on index %q: %v", key, name, err))
+		}
+
+		index := c.indices[name]
+		if index == nil {
+			index = Index{}
+			c.indices[name] = index
+		}
+
+		for _, value := range oldIndexValues {
+			// We optimize for the most common case where index returns a single value.
+			if len(indexValues) == 1 && value == indexValues[0] {
+				continue
+			}
+			c.deleteKeyFromIndex(key, value, index)
+		}
+		for _, value := range indexValues {
+			// We optimize for the most common case where index returns a single value.
+			if len(oldIndexValues) == 1 && value == oldIndexValues[0] {
+				continue
+			}
+			c.addKeyToIndex(key, value, index)
+		}
+	}
+}
+
+```
+
+### WorkQueue
+
+WorkQueue是Kubernetes中使用到的队列，被称作工作队列，具体代码如下
+
+ vendor/k8s.io/client-go/util/workqueue/queue.go
+
+```go
+/*
+Copyright 2015 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package workqueue
+
+import (
+	"sync"
+	"time"
+
+	"k8s.io/apimachinery/pkg/util/clock"
+)
+
+type Interface interface {
+	Add(item interface{})
+	Len() int
+	Get() (item interface{}, shutdown bool)
+	Done(item interface{})
+	ShutDown()
+	ShuttingDown() bool
+}
+
+// New constructs a new work queue (see the package comment).
+func New() *Type {
+	return NewNamed("")
+}
+
+func NewNamed(name string) *Type {
+	rc := clock.RealClock{}
+	return newQueue(
+		rc,
+		globalMetricsFactory.newQueueMetrics(name, rc),
+		defaultUnfinishedWorkUpdatePeriod,
+	)
+}
+
+func newQueue(c clock.Clock, metrics queueMetrics, updatePeriod time.Duration) *Type {
+	t := &Type{
+		clock:                      c,
+		dirty:                      set{},
+		processing:                 set{},
+		cond:                       sync.NewCond(&sync.Mutex{}),
+		metrics:                    metrics,
+		unfinishedWorkUpdatePeriod: updatePeriod,
+	}
+
+	// Don't start the goroutine for a type of noMetrics so we don't consume
+	// resources unnecessarily
+	if _, ok := metrics.(noMetrics); !ok {
+		go t.updateUnfinishedWorkLoop()
+	}
+
+	return t
+}
+
+const defaultUnfinishedWorkUpdatePeriod = 500 * time.Millisecond
+
+// Type is a work queue (see the package comment).
+type Type struct {
+	// queue defines the order in which we will work on items. Every
+	// element of queue should be in the dirty set and not in the
+	// processing set.
+	queue []t
+
+	// dirty defines all of the items that need to be processed.
+	dirty set
+
+	// Things that are currently being processed are in the processing set.
+	// These things may be simultaneously in the dirty set. When we finish
+	// processing something and remove it from this set, we'll check if
+	// it's in the dirty set, and if so, add it to the queue.
+	processing set
+
+	cond *sync.Cond
+
+	shuttingDown bool
+
+	metrics queueMetrics
+
+	unfinishedWorkUpdatePeriod time.Duration
+	clock                      clock.Clock
+}
+
+type empty struct{}
+type t interface{}
+type set map[t]empty
+
+func (s set) has(item t) bool {
+	_, exists := s[item]
+	return exists
+}
+
+func (s set) insert(item t) {
+	s[item] = empty{}
+}
+
+func (s set) delete(item t) {
+	delete(s, item)
+}
+
+// Add marks item as needing processing.
+func (q *Type) Add(item interface{}) {
+	q.cond.L.Lock()
+	defer q.cond.L.Unlock()
+	if q.shuttingDown {
+		return
+	}
+	if q.dirty.has(item) {
+		return
+	}
+
+	q.metrics.add(item)
+
+	q.dirty.insert(item)
+	if q.processing.has(item) {
+		return
+	}
+
+	q.queue = append(q.queue, item)
+	q.cond.Signal()
+}
+
+// Len returns the current queue length, for informational purposes only. You
+// shouldn't e.g. gate a call to Add() or Get() on Len() being a particular
+// value, that can't be synchronized properly.
+func (q *Type) Len() int {
+	q.cond.L.Lock()
+	defer q.cond.L.Unlock()
+	return len(q.queue)
+}
+
+// Get blocks until it can return an item to be processed. If shutdown = true,
+// the caller should end their goroutine. You must call Done with item when you
+// have finished processing it.
+func (q *Type) Get() (item interface{}, shutdown bool) {
+	q.cond.L.Lock()
+	defer q.cond.L.Unlock()
+	for len(q.queue) == 0 && !q.shuttingDown {
+		q.cond.Wait()
+	}
+	if len(q.queue) == 0 {
+		// We must be shutting down.
+		return nil, true
+	}
+
+	item, q.queue = q.queue[0], q.queue[1:]
+
+	q.metrics.get(item)
+
+	q.processing.insert(item)
+	q.dirty.delete(item)
+
+	return item, false
+}
+
+// Done marks item as done processing, and if it has been marked as dirty again
+// while it was being processed, it will be re-added to the queue for
+// re-processing.
+func (q *Type) Done(item interface{}) {
+	q.cond.L.Lock()
+	defer q.cond.L.Unlock()
+
+	q.metrics.done(item)
+
+	q.processing.delete(item)
+	if q.dirty.has(item) {
+		q.queue = append(q.queue, item)
+		q.cond.Signal()
+	}
+}
+
+// ShutDown will cause q to ignore all new items added to it. As soon as the
+// worker goroutines have drained the existing items in the queue, they will be
+// instructed to exit.
+func (q *Type) ShutDown() {
+	q.cond.L.Lock()
+	defer q.cond.L.Unlock()
+	q.shuttingDown = true
+	q.cond.Broadcast()
+}
+
+func (q *Type) ShuttingDown() bool {
+	q.cond.L.Lock()
+	defer q.cond.L.Unlock()
+
+	return q.shuttingDown
+}
+
+func (q *Type) updateUnfinishedWorkLoop() {
+	t := q.clock.NewTicker(q.unfinishedWorkUpdatePeriod)
+	defer t.Stop()
+	for range t.C() {
+		if !func() bool {
+			q.cond.L.Lock()
+			defer q.cond.L.Unlock()
+			if !q.shuttingDown {
+				q.metrics.updateUnfinishedWork()
+				return true
+			}
+			return false
+
+		}() {
+			return
+		}
+	}
+}
+
+```
+
+WorkQueue支持3种队列，并且提供了3种接口，分别是Interface，DelayingInteface，RateLimitingInterface,分别是普通FIFO队列，延迟队列和限速队列
+
+- **Interface**:FIFO队列接口，先进先出队列，并且有去重机制
+
+- **DelayingInterface**:延迟队列接口，基于Interface接口实现封装，包含AddAfter(item interface{}, duration time.Duration)方法，延迟元素入队
+- **RateLimitingInterface**：限速队列接口，基于DelayingInterface接口封装实现，包含AddRateLimited(item interface{})，Forget(item interface{})，NumRequeues(item interface{}) ，支持元素入队队列进行速率限制
+
+#### FIFO队列
+
+FIFO队列是最基本的队列，包含了队列的基本方法
+
+ vendor/k8s.io/client-go/util/workqueue/queue.go
+
+```go
+type Interface interface {
+	Add(item interface{})
+	Len() int
+	Get() (item interface{}, shutdown bool)
+	Done(item interface{})
+	ShutDown()
+	ShutDownWithDrain()
+	ShuttingDown() bool
+}
+```
+
+- **Add**: 给队列添加任意类型的元素
+- **Len**:当前队列的长度
+- **Get**:获取当前队列的头部元素
+- **Done**:标记队列中该元素已经被处理
+- **Shutdown** ：关闭队列
+- **ShutDownWithDrain**:优雅关闭
+- **ShuttingDown**：查询队列是否关闭
+
+ vendor/k8s.io/client-go/util/workqueue/queue.go
+
+```go
+type Type struct {
+	// queue defines the order in which we will work on items. Every
+	// element of queue should be in the dirty set and not in the
+	// processing set.
+	queue []t
+
+	// dirty defines all of the items that need to be processed.
+	dirty set
+
+	// Things that are currently being processed are in the processing set.
+	// These things may be simultaneously in the dirty set. When we finish
+	// processing something and remove it from this set, we'll check if
+	// it's in the dirty set, and if so, add it to the queue.
+	processing set
+
+	cond *sync.Cond
+
+	shuttingDown bool
+	drain        bool
+
+	metrics queueMetrics
+
+	unfinishedWorkUpdatePeriod time.Duration
+	clock                      clock.WithTicker
+}
+```
+
+FIFO队列的数据结构如上所示，主要包含了的queue，dirty，processing
