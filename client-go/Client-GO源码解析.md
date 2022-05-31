@@ -2,7 +2,7 @@
 
 [toc]
 
-## Informer机制
+### Informer机制
 
 Kubernetes的其他组件通过informer机制与Kubernetes API Server进行交互通信，保证了消息的实时性，可靠性，顺序性。Informer机制架构如图所示：
 
@@ -1177,4 +1177,432 @@ type Type struct {
 }
 ```
 
-FIFO队列的数据结构如上所示，主要包含了的queue，dirty，processing
+FIFO队列的数据结构如上所示，主要包含了的queue，dirty，processing。其中queue是实际存储元素的数据结构，是一个slice结构，这样就能确保queue的有序性，dirty字段，定义了所有需要被处理的元素，包含了去重的特性，保证了在并发的情况下，处理一个元素前即使被添加了多次，也只会被处理一次。processing字段则用于标记，标记一个元素是否正在处理，并且queue中包含的每个元素，都应该在dirty set中，但不在processing的set中。**ADD**方法的分析如下图所示：
+
+![image-20220530152907506](https://github.com/JING21/K8S/raw/main/client-go/queue-p.png)
+
+ vendor/k8s.io/client-go/util/workqueue/queue.go
+
+```go
+// Add marks item as needing processing.
+func (q *Type) Add(item interface{}) {
+	q.cond.L.Lock()
+	defer q.cond.L.Unlock()
+	if q.shuttingDown {
+		return
+	}
+	if q.dirty.has(item) {
+		return
+	}
+
+	q.metrics.add(item)
+
+	q.dirty.insert(item)
+	if q.processing.has(item) {
+		return
+	}
+
+	q.queue = append(q.queue, item)
+	q.cond.Signal()
+}
+
+
+func (q *Type) Get() (item interface{}, shutdown bool) {
+	q.cond.L.Lock()
+	defer q.cond.L.Unlock()
+	for len(q.queue) == 0 && !q.shuttingDown {
+		q.cond.Wait()
+	}
+	if len(q.queue) == 0 {
+		// We must be shutting down.
+		return nil, true
+	}
+
+	item = q.queue[0]
+	// The underlying array still exists and reference this object, so the object will not be garbage collected.
+	q.queue[0] = nil
+	q.queue = q.queue[1:]
+
+	q.metrics.get(item)
+
+	q.processing.insert(item)
+	q.dirty.delete(item)
+
+	return item, false
+}
+
+func (q *Type) Done(item interface{}) {
+	q.cond.L.Lock()
+	defer q.cond.L.Unlock()
+
+	q.metrics.done(item)
+
+	q.processing.delete(item)
+	if q.dirty.has(item) {
+		q.queue = append(q.queue, item)
+		q.cond.Signal()
+	} else if q.processing.len() == 0 {
+		q.cond.Signal()
+	}
+}
+```
+
+通过**Add**方法分别向队列中插入元素1，2，3，**Add**方法判断dirty set中不存在该三个元素，同时，processing set中也不存在该三个元素，会将其加入dirty的set中。然后通过Get方法获取第一个进入队列的元素，获取queue[0]元素，即图中所示的元素1，（Get方法会阻塞，直到正常的返回所需元素，同时当队列为空并且shuttingDown信号部位为false时，也会进入等待状态），并且在processing中加入元素1（表示元素1正在处理中），同时会删除dirty set中对应的元素1，最后当处理完元素1后，会调用Done删除元素1，(如果元素1被再次标记dirty的话，会重新入队，重新进行处理）
+
+下图为在并发情况下，如何保证一个元素哪怕被添加多次也只会处理一次的逻辑：
+
+![image-20220530150336270](https://github.com/JING21/K8S/raw/main/client-go/queue-re.png)
+
+在并发的场景下，假如goroutineA通过**Get**方法获取到了元素1，并且元素1被添加到processing的set中，同一时间，goroutineB通过**Add**方法加入了元素1，此时**Add**方法会先判断dirty set中不存在元素1，会将其加入dirty set，之后判断发现processing set中存在元素1，因此不会继续将其添加到queue队列中，而后，当goroutineA完成了处理调用了**Done**方法，判断发现dirty set中仍然存在元素1，则会重新将元素1入队，位于队列尾部。dirty和processing都是由Hash Map实现的，所以是无序的，仅保证去重。
+
+#### 延迟队列
+
+延迟队列是基于FIFO队列的接口进行封装，在原有的功能上增加了**AddAfter**方法，其作用是延迟一段时间后再将元素插入队列，具体接口定义如下所示：
+
+ vendor/k8s.io/client-go/util/workqueue/delaying_queue.go
+
+```go
+type DelayingInterface interface {
+	Interface
+	// AddAfter adds an item to the workqueue after the indicated duration has passed
+	AddAfter(item interface{}, duration time.Duration)
+}
+
+
+type delayingType struct {
+	Interface
+
+	// clock tracks time for delayed firing
+	clock clock.Clock
+
+	// stopCh lets us signal a shutdown to the waiting loop
+	stopCh chan struct{}
+	// stopOnce guarantees we only signal shutdown a single time
+	stopOnce sync.Once
+
+	// heartbeat ensures we wait no more than maxWait before firing
+	heartbeat clock.Ticker
+
+	// waitingForAddCh is a buffered channel that feeds waitingForAdd
+	waitingForAddCh chan *waitFor
+
+	// metrics counts the number of retries
+	metrics retryMetrics
+}
+
+type waitFor struct {
+	data    t
+	readyAt time.Time
+	// index in the priority queue (heap)
+	index int
+}
+```
+
+**AddAfter**方法会插入一个item（即要插入的元素）参数，并且附带上一个duration（延迟时间）参数，该duration参数会用于指定元素插入FIFO队列的延迟的时间。如果duration小于等0，则表示立马插入队列。
+
+**delayingType**结构中最主要的字段就是**waitingForAddCh**，其默认初始大小为1000，而waitFor 结构包含实现了waitForProrityQueue这么一个优先队列，实现了一个堆。通过**AddAfter**方法插入元素时，是非阻塞状态的，只有当插入的元素大于或等于1000时，延迟队列才会进入阻塞状态。**waitingForAddCh **chan的数据通过goroutine运行的waitingLoop函数运行传输，运行情况如下图所示：
+
+![image-20220530162439842](https://github.com/JING21/K8S/raw/main/client-go/delayingqueue.png)
+
+ vendor/k8s.io/client-go/util/workqueue/delaying_queue.go
+
+```go
+// waitingLoop runs until the workqueue is shutdown and keeps a check on the list of items to be added.
+func (q *delayingType) waitingLoop() {
+	defer utilruntime.HandleCrash()
+
+	// Make a placeholder channel to use when there are no items in our list
+	never := make(<-chan time.Time)
+
+	// Make a timer that expires when the item at the head of the waiting queue is ready
+	var nextReadyAtTimer clock.Timer
+
+	waitingForQueue := &waitForPriorityQueue{}
+	heap.Init(waitingForQueue)
+
+	waitingEntryByData := map[t]*waitFor{}
+
+	for {
+		if q.Interface.ShuttingDown() {
+			return
+		}
+
+		now := q.clock.Now()
+
+		// Add ready entries
+		for waitingForQueue.Len() > 0 {
+			entry := waitingForQueue.Peek().(*waitFor)
+			if entry.readyAt.After(now) {
+				break
+			}
+
+			entry = heap.Pop(waitingForQueue).(*waitFor)
+			q.Add(entry.data)
+			delete(waitingEntryByData, entry.data)
+		}
+
+		// Set up a wait for the first item's readyAt (if one exists)
+		nextReadyAt := never
+		if waitingForQueue.Len() > 0 {
+			if nextReadyAtTimer != nil {
+				nextReadyAtTimer.Stop()
+			}
+			entry := waitingForQueue.Peek().(*waitFor)
+			nextReadyAtTimer = q.clock.NewTimer(entry.readyAt.Sub(now))
+			nextReadyAt = nextReadyAtTimer.C()
+		}
+
+		select {
+		case <-q.stopCh:
+			return
+
+		case <-q.heartbeat.C():
+			// continue the loop, which will add ready items
+
+		case <-nextReadyAt:
+			// continue the loop, which will add ready items
+
+		case waitEntry := <-q.waitingForAddCh:
+			if waitEntry.readyAt.After(q.clock.Now()) {
+				insert(waitingForQueue, waitingEntryByData, waitEntry)
+			} else {
+				q.Add(waitEntry.data)
+			}
+
+			drained := false
+			for !drained {
+				select {
+				case waitEntry := <-q.waitingForAddCh:
+					if waitEntry.readyAt.After(q.clock.Now()) {
+						insert(waitingForQueue, waitingEntryByData, waitEntry)
+					} else {
+						q.Add(waitEntry.data)
+					}
+				default:
+					drained = true
+				}
+			}
+		}
+	}
+}
+```
+
+如图所示，将元素1放入**waitingForAddCh** chan中后，通过**waitingLoop**这个goroutine消费这个元素，当元素的延迟时间不大于当前时间时，说明该元素不会立马入队，而是需要延迟一段时间入队，此时会将元素先放在优秀队列（实际上是一个堆）。当元素的延迟时间大于当前时间，则表明该元素需要直接入队，加入FIFO队列中。同时，**waitingLoop**会遍历优先队列**waitingForQueue**（waitForPriorityQueue类型），根据上述逻辑验证延迟时间和当前时间，进行入队操作和从优秀队列去除的操作。
+
+#### 限速队列
+
+限速队列接口（RateLimitingInterface）是基于延迟队列接口进行封装，增加了**AddRateLimited**,**Forget**,**NumRequeus**方法。限速队列的重点在于其提供了4种不同的限速算法接口（RateLimiter），其核心原理是，限速队列利用延迟队列的特性，延迟某个队列的入队时间，从而达到限速的目的，其中限速算法的接口也如下所示:
+
+ vendor/k8s.io/client-go/util/workqueue/rate_limiting_queue.go
+
+```go
+type RateLimitingInterface interface {
+	DelayingInterface
+
+	// AddRateLimited adds an item to the workqueue after the rate limiter says it's ok
+	AddRateLimited(item interface{})
+
+	// Forget indicates that an item is finished being retried.  Doesn't matter whether it's for perm failing
+	// or for success, we'll stop the rate limiter from tracking it.  This only clears the `rateLimiter`, you
+	// still have to call `Done` on the queue.
+	Forget(item interface{})
+
+	// NumRequeues returns back how many times the item was requeued
+	NumRequeues(item interface{}) int
+}
+```
+
+ vendor/k8s.io/client-go/util/workqueue/default_rate_limiters_queue.go
+
+```go
+type RateLimiter interface {
+	// When gets an item and gets to decide how long that item should wait
+	When(item interface{}) time.Duration
+	// Forget indicates that an item is finished being retried.  Doesn't matter whether it's for failing
+	// or for success, we'll stop tracking it
+	Forget(item interface{})
+	// NumRequeues returns back how many failures the item has had
+	NumRequeues(item interface{}) int
+}
+```
+
+- **When**: 获取指定元素的应该等待时间
+- **Forgert**：无论是否成功，释放该元素，清空该元素的排队数
+- **NumRequeues**:获取该元素的失败数（排队数）
+
+其中限速周期是指，一个限速周期是指一个元素从执行**AddRateLimited**方法到执行完成**Forget**方法之间的时间，如果该元素被**Forget**方法处理完成，则清空排队数。Client-go提供了默认4种限速算法，应对不同场景：
+
+- 令牌桶算法（BuckRateLimiter）
+- 排队指数算法（ItemExponentialFailureRateLimiter）
+- 计算器算法（ItemFastSlowRateLimiter）
+- 混合模式（MaxOfRateLimiter）
+
+##### 令牌桶算法
+
+令牌桶算法是通过golang的第三方库golang.org/x/time/rate实现的。具体的数据结构定义如下：
+
+golang.org/x/time/rate/rate.go
+
+```golang
+type Limiter struct {
+	mu     sync.Mutex
+	limit  Limit
+	burst  int
+	tokens float64
+	// last is the last time the limiter's tokens field was updated
+	last time.Time
+	// lastEvent is the latest time of a rate-limited event (past or future)
+	lastEvent time.Time
+}
+```
+
+令牌桶算法实现一个存储**token**的桶结构，初始时桶为空，token会以固定速率被填进桶里，直至填满为止，而多余的token则会被废弃。然后每个元素都会从令牌桶中得到一个token，只有得到token的元素才能通过校验（accept），而没有得到token的元素需要等待获取到token。令牌桶算法通过控制发放token来达到限速的目的。
+
+![image-20220531102137916](https://github.com/JING21/K8S/raw/main/client-go/bucketRateLimiter.png)
+
+ vendor/k8s.io/client-go/util/workqueue/default_rate_limiters_queue.go
+
+```go
+func DefaultControllerRateLimiter() RateLimiter {
+	return NewMaxOfRateLimiter(
+		NewItemExponentialFailureRateLimiter(5*time.Millisecond, 1000*time.Second),
+		// 10 qps, 100 bucket size.  This is only for retry speed and its only the overall factor (not per item)
+		&BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+	)
+}
+```
+
+golang.org/x/time/rate/rate.go
+
+```go
+// NewLimiter returns a new Limiter that allows events up to rate r and permits
+// bursts of at most b tokens.
+func NewLimiter(r Limit, b int) *Limiter {
+	return &Limiter{
+		limit: r,
+		burst: b,
+	}
+}
+```
+
+Workqueue在默认情况下会实例化令牌桶，rate.NewLimiter(r,b)，实例化limiter后传入了r，b两个参数，其中r表示每秒放入桶中的token数量，b表示桶的大小（能存放token的最大值）。假设在一个限速周期内添加了500个元素，通过r.Limiter.Reserve().Delay()可以得到具体某个元素需要等待的时长，那么前b个（例子中为100）100个元素会直接取到token，直接处理。而后面的元素item100开始，会延迟item100/100ms,item101/200ms,item102/300ms。
+
+ vendor/k8s.io/client-go/util/workqueue/default_rate_limiters_queue.go
+
+```go
+func (r *BucketRateLimiter) When(item interface{}) time.Duration {
+	return r.Limiter.Reserve().Delay()
+}
+```
+
+golang.org/x/time/rate/rate.go
+
+```go
+// Delay is shorthand for DelayFrom(time.Now()).
+func (r *Reservation) Delay() time.Duration {
+	return r.DelayFrom(time.Now())
+}
+```
+
+##### 排队指数算法
+
+排队指数算法将相同元素的排队数作为指数，排队数增大时，速率呈指数级增长，但最大值不会超过**maxDelay**。但是该统计是以一个限速周期内进行计算的，即执行**AddRateLimited**方法至**Forget**方法之间的时间，如果该元素被**Forget**方法处理完，则清空排队数，核心代码如下：
+
+ vendor/k8s.io/client-go/util/workqueue/default_rate_limiters_queue.go
+
+```go
+func (r *ItemExponentialFailureRateLimiter) When(item interface{}) time.Duration {
+	r.failuresLock.Lock()
+	defer r.failuresLock.Unlock()
+
+	exp := r.failures[item]
+	r.failures[item] = r.failures[item] + 1
+
+	// The backoff is capped such that 'calculated' value never overflows.
+	backoff := float64(r.baseDelay.Nanoseconds()) * math.Pow(2, float64(exp))
+	if backoff > math.MaxInt64 {
+		return r.maxDelay
+	}
+
+	calculated := time.Duration(backoff)
+	if calculated > r.maxDelay {
+		return r.maxDelay
+	}
+
+	return calculated
+}
+```
+
+其中主要的字段包含**failures**，**baseDelay**，**maxDelay**。其中**failures**字段表示元素重新入队次数，即排队数，每当**AddRateLimited**方法插入一个新的元素时，**failures**即会累加。**baseDelay**字段是最初的限速单位，为5ms，而默认**maxDelay**字段是最大限速单位，为1000s。
+
+限速队列利用延迟队列，延迟入队的特性，延迟相同的多个元素入队，从而达到限速的目的。在同一限速周期内，如果不存在相同的元素，那么所有的元素的延迟时间均为**baseDelay**,但是如果存在相同元素，相同元素延迟时间呈指数增长。
+
+使用默认的**baseDelay**是1*time.Millisecond，**maxDelay**是1000 *time.Second。假设在一个限速周期内，插入10个相同的元素，第一个元素设置的延迟时间即为**baseDelay**(1ms),第二个则为2ms,第三个则为4ms，第四个则为8ms，第五个则为16ms.....以此类推第十个即为512ms，最长的延迟时间部的大过**maxDelay**（1000s）。
+
+##### 计数器算法
+
+计数器算法的原理是，限制的一段时间内允许通过的元素数量，例如1分钟只能通过50个元素，每插入一个元素，计数器就自增1，当计数器达到阈值50时并且还在限速周期内，就不允许元素继续通过。
+
+ vendor/k8s.io/client-go/util/workqueue/default_rate_limiters_queue.go
+
+```go
+type ItemFastSlowRateLimiter struct {
+	failuresLock sync.Mutex
+	failures     map[interface{}]int
+
+	maxFastAttempts int
+	fastDelay       time.Duration
+	slowDelay       time.Duration
+}
+
+var _ RateLimiter = &ItemFastSlowRateLimiter{}
+
+func NewItemFastSlowRateLimiter(fastDelay, slowDelay time.Duration, maxFastAttempts int) RateLimiter {
+	return &ItemFastSlowRateLimiter{
+		failures:        map[interface{}]int{},
+		fastDelay:       fastDelay,
+		slowDelay:       slowDelay,
+		maxFastAttempts: maxFastAttempts,
+	}
+}
+
+func (r *ItemFastSlowRateLimiter) When(item interface{}) time.Duration {
+	r.failuresLock.Lock()
+	defer r.failuresLock.Unlock()
+
+	r.failures[item] = r.failures[item] + 1
+
+	if r.failures[item] <= r.maxFastAttempts {
+		return r.fastDelay
+	}
+
+	return r.slowDelay
+}
+```
+
+**ItemFastSlowRateLimiter**包含了4个主要字段，**failures**，**fastDelay**，**slowDelay**，**maxFastAttempts**。**failures**是用于统计元素排队数的，每当有新元素插入时，该字段会加1，而**fastDelay**，**slowDelay**则是用于定义fast,slow速率的，当排队数不大于**maxFastAttempts**时，就会使用**fastDelay**速率，否则就使用**slowDelay**速率。
+
+假设**fastDelay**是5* time.Millisecond,而**slowDelay**是20* time.Millisecond, **maxFastAttempts**是10，在一个限速周期内，当调用**AddRateLimited**方法插入第十一个相同元素时，前十个会用**fastDelay**速率，而从11个开始则会使用**slowDelay**速率。
+
+##### 混合模式
+
+混合模式即使用多种限速算法混合使用，如**DefaultControllerRateLimiter**使用了排队指数算法和令牌桶算法
+
+ vendor/k8s.io/client-go/util/workqueue/default_rate_limiters_queue.go
+
+```go
+type MaxOfRateLimiter struct {
+	limiters []RateLimiter
+}
+
+func DefaultControllerRateLimiter() RateLimiter {
+	return NewMaxOfRateLimiter(
+		NewItemExponentialFailureRateLimiter(5*time.Millisecond, 1000*time.Second),
+		// 10 qps, 100 bucket size.  This is only for retry speed and its only the overall factor (not per item)
+		&BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+	)
+}
+```
+
+
+
