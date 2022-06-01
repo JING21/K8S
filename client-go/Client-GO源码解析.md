@@ -10,7 +10,7 @@ Kubernetes的其他组件通过informer机制与Kubernetes API Server进行交�
 
 ### Reflector组件
 
-Reflector组件用于监控（List and Watch）指定的Kubernetes资源，当资源发生变化时，触发相对应的的事件，比如说ADD(添加资源)，Update（更新资源），Deleted（删除事件），并将其资源存储在本地缓存DeltaFIFO。
+Reflector组件用于监控（List and Watch）指定的Kubernetes资源，当资源发生变化时，触发相对应的的事件，比如说ADD(添加资源)，Update（更新资源），Deleted（删除事件），并将其资源存储在DeltaFIFO。
 
 其中reflector的结构体定义如下所示：
 
@@ -890,7 +890,7 @@ func (c *threadSafeMap) updateIndices(oldObj interface{}, newObj interface{}, ke
 
 WorkQueue是Kubernetes中使用到的队列，被称作工作队列，具体代码如下
 
- vendor/k8s.io/client-go/util/workqueue/queue.go
+k8s.io/client-go/util/workqueue/queue.go
 
 ```go
 /*
@@ -1125,7 +1125,7 @@ WorkQueue支持3种队列，并且提供了3种接口，分别是Interface，Del
 
 FIFO队列是最基本的队列，包含了队列的基本方法
 
- vendor/k8s.io/client-go/util/workqueue/queue.go
+k8s.io/client-go/util/workqueue/queue.go
 
 ```go
 type Interface interface {
@@ -1147,7 +1147,7 @@ type Interface interface {
 - **ShutDownWithDrain**:优雅关闭
 - **ShuttingDown**：查询队列是否关闭
 
- vendor/k8s.io/client-go/util/workqueue/queue.go
+k8s.io/client-go/util/workqueue/queue.go
 
 ```go
 type Type struct {
@@ -1181,7 +1181,7 @@ FIFO队列的数据结构如上所示，主要包含了的queue，dirty，proces
 
 ![image-20220530152907506](https://github.com/JING21/K8S/raw/main/client-go/queue-p.png)
 
- vendor/k8s.io/client-go/util/workqueue/queue.go
+ k8s.io/client-go/util/workqueue/queue.go
 
 ```go
 // Add marks item as needing processing.
@@ -1601,6 +1601,673 @@ func DefaultControllerRateLimiter() RateLimiter {
 		// 10 qps, 100 bucket size.  This is only for retry speed and its only the overall factor (not per item)
 		&BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
 	)
+}
+```
+
+
+
+#### demo
+
+如下所示的是informer机制的简单的demo code：
+
+```go
+package main
+
+import (
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd"
+	"log"
+	"time"
+)
+
+
+func main(){
+	 config, err := clientcmd.BuildConfigFromFlags("","/Users/jing/Desktop/config")
+	 if err != nil{
+	 	panic(err)
+	 }
+
+	clientSet, err := kubernetes.NewForConfig(config)
+	if err !=nil{
+		panic(err)
+	}
+
+	stopChan := make(chan struct{})
+	defer close(stopChan)
+
+	sharedInformers := informers.NewSharedInformerFactory(clientSet, time.Minute)
+
+	podInformer := sharedInformers.Core().V1().Pods().Informer()
+
+	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			addObj := obj.(v1.Object)
+			log.Printf("New pod Added tp Store %s", addObj.GetName())
+		},
+	})
+
+	podInformer.Run(stopChan)
+}
+
+```
+
+具体的代码调用逻辑如下所示：
+
+- 首先创建**sharedInformers**对象
+
+​		每个不同的资源都创建了Informer，监控资源不同的事件，而且每个Informer都会实现**Informer**和**Lister**方法,以例子中的**PodInformer**为例：
+
+k8s.io/client-go/informers/core/v1/pod.go
+
+```go
+type PodInformer interface {
+	Informer() cache.SharedIndexInformer
+	Lister() v1.PodLister
+}
+```
+
+SharedInformer的作用是确保同样的一个资源，比如说pod的Informer，其reflector不需要实例化过多次。因为实例化过多次，运行过多的list，watch func,会有过多的序列化和反序列化操作，加重对api-server的负担。因此SharedInformer可以满足对于同样的资源，比如说pod共享一个reflector。其中定义了**informers** 这样一个map数据结构，用于存放所有的Informer。
+
+k8s.io/client-go/informers/factory.go
+
+```go
+
+type sharedInformerFactory struct {
+	client           kubernetes.Interface
+	namespace        string
+	tweakListOptions internalinterfaces.TweakListOptionsFunc
+	lock             sync.Mutex
+	defaultResync    time.Duration
+	customResync     map[reflect.Type]time.Duration
+
+	informers map[reflect.Type]cache.SharedIndexInformer
+	// startedInformers is used for tracking which informers have been started.
+	// This allows Start() to be called multiple times safely.
+	startedInformers map[reflect.Type]bool
+}
+
+```
+
+- 第二步，demo中，创建好sharedInformer对象后，调用具体的实现，获取到了**podInformer**这个实例,具体代码如下:
+
+k8s.io/client-go/informers/core/v1/pod.go
+
+```go
+func (f *podInformer) defaultInformer(client kubernetes.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
+	return NewFilteredPodInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+}
+
+func (f *podInformer) Informer() cache.SharedIndexInformer {
+	return f.factory.InformerFor(&corev1.Pod{}, f.defaultInformer)
+}
+
+func NewFilteredPodInformer(client kubernetes.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
+	return cache.NewSharedIndexInformer(
+		&cache.ListWatch{
+			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&options)
+				}
+				return client.CoreV1().Pods(namespace).List(context.TODO(), options)
+			},
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&options)
+				}
+				return client.CoreV1().Pods(namespace).Watch(context.TODO(), options)
+			},
+		},
+		&corev1.Pod{},
+		resyncPeriod,
+		indexers,
+	)
+}
+```
+
+k8s.io/client-go/tools/cache/shared_informer.go
+
+```go
+func NewSharedIndexInformer(lw ListerWatcher, exampleObject runtime.Object, defaultEventHandlerResyncPeriod time.Duration, indexers Indexers) SharedIndexInformer {
+	realClock := &clock.RealClock{}
+	sharedIndexInformer := &sharedIndexInformer{
+		processor:                       &sharedProcessor{clock: realClock},
+		indexer:                         NewIndexer(DeletionHandlingMetaNamespaceKeyFunc, indexers),
+		listerWatcher:                   lw,
+		objectType:                      exampleObject,
+		resyncCheckPeriod:               defaultEventHandlerResyncPeriod,
+		defaultEventHandlerResyncPeriod: defaultEventHandlerResyncPeriod,
+		cacheMutationDetector:           NewCacheMutationDetector(fmt.Sprintf("%T", exampleObject)),
+		clock:                           realClock,
+	}
+	return sharedIndexInformer
+}
+```
+
+获取pod的informer，调用**f.factory.InformerFor**,分别传入**runtime.object**类型即**corev1.Pod**类型和**newFunc NewInformerFunc**创建返回一个初始化informer的**NewInformerFunc**，此处调用的是**f.defaultInformer**,而**f.defaultInformer**会初始化该informer，包含了注册对应的List，watch方法，传入对应的**runtime.object**即**corev1.Pod**,**resyncPeriod**重新同步的时间和**indexers**。具体调用了**cache.NewSharedIndexInformer**,其中会初始化**processor**和**indexer**
+
+- 接下来第三步，则会给informer注册用户自定义的回调函数，当资源信息发生变化时，会根据回调函数，实现具体的逻辑，具体代码如下：
+
+k8s.io/client-go/tools/cache/shared_informer.go
+
+```go
+func (s *sharedIndexInformer) AddEventHandler(handler ResourceEventHandler) {
+	s.AddEventHandlerWithResyncPeriod(handler, s.defaultEventHandlerResyncPeriod)
+}
+
+
+func (s *sharedIndexInformer) AddEventHandlerWithResyncPeriod(handler ResourceEventHandler, resyncPeriod time.Duration) {
+	s.startedLock.Lock()
+	defer s.startedLock.Unlock()
+
+	if s.stopped {
+		klog.V(2).Infof("Handler %v was not added to shared informer because it has stopped already", handler)
+		return
+	}
+
+	if resyncPeriod > 0 {
+		if resyncPeriod < minimumResyncPeriod {
+			klog.Warningf("resyncPeriod %v is too small. Changing it to the minimum allowed value of %v", resyncPeriod, minimumResyncPeriod)
+			resyncPeriod = minimumResyncPeriod
+		}
+
+		if resyncPeriod < s.resyncCheckPeriod {
+			if s.started {
+				klog.Warningf("resyncPeriod %v is smaller than resyncCheckPeriod %v and the informer has already started. Changing it to %v", resyncPeriod, s.resyncCheckPeriod, s.resyncCheckPeriod)
+				resyncPeriod = s.resyncCheckPeriod
+			} else {
+				// if the event handler's resyncPeriod is smaller than the current resyncCheckPeriod, update
+				// resyncCheckPeriod to match resyncPeriod and adjust the resync periods of all the listeners
+				// accordingly
+				s.resyncCheckPeriod = resyncPeriod
+				s.processor.resyncCheckPeriodChanged(resyncPeriod)
+			}
+		}
+	}
+
+	listener := newProcessListener(handler, resyncPeriod, determineResyncPeriod(resyncPeriod, s.resyncCheckPeriod), s.clock.Now(), initialBufferSize)
+
+	if !s.started {
+		s.processor.addListener(listener)
+		return
+	}
+
+	// in order to safely join, we have to
+	// 1. stop sending add/update/delete notifications
+	// 2. do a list against the store
+	// 3. send synthetic "Add" events to the new handler
+	// 4. unblock
+	s.blockDeltas.Lock()
+	defer s.blockDeltas.Unlock()
+
+	s.processor.addListener(listener)
+	for _, item := range s.indexer.List() {
+		listener.add(addNotification{newObj: item})
+	}
+}
+
+func (p *sharedProcessor) addListener(listener *processorListener) {
+	p.listenersLock.Lock()
+	defer p.listenersLock.Unlock()
+
+	p.addListenerLocked(listener)
+	if p.listenersStarted {
+		p.wg.Start(listener.run)
+		p.wg.Start(listener.pop)
+	}
+}
+```
+
+每一个listener，都会通过**newProcessListener**初始化一个实例对象，而每个listener都会对应一个handle方法，即用户添加的自定义回调函数，每当有资源事件发生变动，就会分发给listener，之后调用handler方法，进入具体的处理逻辑。之后会将通过**addListener**每个listener添加到上面初始化的sharedProcessor中。而**addListener**具体则启动了两个协程**listener.run**和**listener.pop**
+
+k8s.io/client-go/tools/cache/shared_informer.go
+
+```go
+func (p *processorListener) run() {
+	// this call blocks until the channel is closed.  When a panic happens during the notification
+	// we will catch it, **the offending item will be skipped!**, and after a short delay (one second)
+	// the next notification will be attempted.  This is usually better than the alternative of never
+	// delivering again.
+	stopCh := make(chan struct{})
+	wait.Until(func() {
+		for next := range p.nextCh {
+			switch notification := next.(type) {
+			case updateNotification:
+				p.handler.OnUpdate(notification.oldObj, notification.newObj)
+			case addNotification:
+				p.handler.OnAdd(notification.newObj)
+			case deleteNotification:
+				p.handler.OnDelete(notification.oldObj)
+			default:
+				utilruntime.HandleError(fmt.Errorf("unrecognized notification: %T", next))
+			}
+		}
+		// the only way to get here is if the p.nextCh is empty and closed
+		close(stopCh)
+	}, 1*time.Second, stopCh)
+}
+
+
+func (p *processorListener) pop() {
+	defer utilruntime.HandleCrash()
+	defer close(p.nextCh) // Tell .run() to stop
+
+	var nextCh chan<- interface{}
+	var notification interface{}
+	for {
+		select {
+		case nextCh <- notification:
+			// Notification dispatched
+			var ok bool
+			notification, ok = p.pendingNotifications.ReadOne()
+			if !ok { // Nothing to pop
+				nextCh = nil // Disable this select case
+			}
+		case notificationToAdd, ok := <-p.addCh:
+			if !ok {
+				return
+			}
+			if notification == nil { // No notification to pop (and pendingNotifications is empty)
+				// Optimize the case - skip adding to pendingNotifications
+				notification = notificationToAdd
+				nextCh = p.nextCh
+			} else { // There is already a notification waiting to be dispatched
+				p.pendingNotifications.WriteOne(notificationToAdd)
+			}
+		}
+	}
+}
+```
+
+processorListener代表了一个具体的消费者对象，run这个方法会周期性执行，从**nextCh**中获取事件，然后调用handler中对应的用户注册的自定义方法做具体的处理逻辑。run方法是一个消费者方法，负责消费事件。
+
+而pop方法则是生产者方法，负责将消息事件放入**nextCh**中，具体实现比较复杂，首先在循环中，分为两个情况将**notification**放入**nextCh**中，而初始化时，notification为空，第一个情况**nextCh <- notification**发生阻塞，则会进入第二个情况**notificationToAdd, ok := <-p.addCh**从**addCh**获取数据，当**notification**为空时，会将其修改为**notificationToAdd**，同时将**p.nextCh**指向**nextCh**，判断**notification**不为空后，向**nextCh**中写入刚才获取到的**notificationToAdd**，然后会进入第一种情况，将notification放入**nextCh**中。而pop方法是从p.addCh中消费，然后生产notification给**nextCh**。
+
+- 最后一步，就是启动**podInformer**，使用podInformer.Run(stopChan)
+
+k8s.io/client-go/tools/cache/shared_informer.go
+
+```go
+func (s *sharedIndexInformer) Run(stopCh <-chan struct{}) {
+	defer utilruntime.HandleCrash()
+
+	fifo := NewDeltaFIFOWithOptions(DeltaFIFOOptions{
+		KnownObjects:          s.indexer,
+		EmitDeltaTypeReplaced: true,
+	})
+
+	cfg := &Config{
+		Queue:            fifo,
+		ListerWatcher:    s.listerWatcher,
+		ObjectType:       s.objectType,
+		FullResyncPeriod: s.resyncCheckPeriod,
+		RetryOnError:     false,
+		ShouldResync:     s.processor.shouldResync,
+
+		Process:           s.HandleDeltas,
+		WatchErrorHandler: s.watchErrorHandler,
+	}
+
+	func() {
+		s.startedLock.Lock()
+		defer s.startedLock.Unlock()
+
+		s.controller = New(cfg)
+		s.controller.(*controller).clock = s.clock
+		s.started = true
+	}()
+
+	// Separate stop channel because Processor should be stopped strictly after controller
+	processorStopCh := make(chan struct{})
+	var wg wait.Group
+	defer wg.Wait()              // Wait for Processor to stop
+	defer close(processorStopCh) // Tell Processor to stop
+	wg.StartWithChannel(processorStopCh, s.cacheMutationDetector.Run)
+	wg.StartWithChannel(processorStopCh, s.processor.run)
+
+	defer func() {
+		s.startedLock.Lock()
+		defer s.startedLock.Unlock()
+		s.stopped = true // Don't want any new listeners
+	}()
+	s.controller.Run(stopCh)
+}
+```
+
+Run方法主要包含了以下几个重要操作：
+
+- DeltaFIFO的初始化
+- s.controller的初始化
+- s.cacheMutationDetector.Run启动
+- s.processor.run启动
+- s.controller.Run(stopCh)启动
+
+DeltaFIFO初始化代码如下所示,主要操作就是根据传入的opts配置，初始化对应的DeltaFIFO，包含了一个string类型的数组和一个map类型的**items**，其中queue这个队列存放的是每个objectkey,而map中则存放了，对应objectkey的object的不同操作，比如说added，synced，updated，deleted。
+
+k8s.io/client-go/tools/cache/delta_fifo.go
+
+```go
+func NewDeltaFIFOWithOptions(opts DeltaFIFOOptions) *DeltaFIFO {
+	if opts.KeyFunction == nil {
+		opts.KeyFunction = MetaNamespaceKeyFunc
+	}
+
+	f := &DeltaFIFO{
+		items:        map[string]Deltas{},
+		queue:        []string{},
+		keyFunc:      opts.KeyFunction,
+		knownObjects: opts.KnownObjects,
+
+		emitDeltaTypeReplaced: opts.EmitDeltaTypeReplaced,
+	}
+	f.cond.L = &f.lock
+	return f
+}
+```
+
+s.processor.run启动的代码如下所示，遍历sharedProcessor所有的listener，启动两个协程，分别指向运行消费者方法run和生产者方法pop。
+
+k8s.io/client-go/tools/cache/shared_informer.go
+
+```go
+func (p *sharedProcessor) run(stopCh <-chan struct{}) {
+	func() {
+		p.listenersLock.RLock()
+		defer p.listenersLock.RUnlock()
+		for _, listener := range p.listeners {
+			p.wg.Start(listener.run)
+			p.wg.Start(listener.pop)
+		}
+		p.listenersStarted = true
+	}()
+	<-stopCh
+	p.listenersLock.RLock()
+	defer p.listenersLock.RUnlock()
+	for _, listener := range p.listeners {
+		close(listener.addCh) // Tell .pop() to stop. .pop() will tell .run() to stop
+	}
+	p.wg.Wait() // Wait for all .pop() and .run() to stop
+}
+```
+
+s.controller.Run(stopCh)启动部分的代码具体如下所示，包含了以下的主要逻辑：
+
+- 初始化Reflector
+- 启动wg.StartWithChannel(stopCh, r.Run)
+- 调用wait.Until(c.processLoop, time.Second, stopCh)
+
+k8s.io/client-go/tools/cache/controller.go
+
+```go
+func (c *controller) Run(stopCh <-chan struct{}) {
+	defer utilruntime.HandleCrash()
+	go func() {
+		<-stopCh
+		c.config.Queue.Close()
+	}()
+	r := NewReflector(
+		c.config.ListerWatcher,
+		c.config.ObjectType,
+		c.config.Queue,
+		c.config.FullResyncPeriod,
+	)
+	r.ShouldResync = c.config.ShouldResync
+	r.WatchListPageSize = c.config.WatchListPageSize
+	r.clock = c.clock
+	if c.config.WatchErrorHandler != nil {
+		r.watchErrorHandler = c.config.WatchErrorHandler
+	}
+
+	c.reflectorMutex.Lock()
+	c.reflector = r
+	c.reflectorMutex.Unlock()
+
+	var wg wait.Group
+
+	wg.StartWithChannel(stopCh, r.Run)
+
+	wait.Until(c.processLoop, time.Second, stopCh)
+	wg.Wait()
+}
+```
+
+Reflector的Run方法具体代码如下,主要的逻辑是，启动ListAndWatch函数，list用于获取对应资源对象的全量数据，将获取资源对象转换为对应的资源对象列表，将资源对象列表存入DeltaFIFO，全量替换本地缓存（ThreadSafeMap）,调用watch方法监听对应资源，监听到变化时，调用对应watchHandler函数，处理对应的事件。watchHandler中的store是DeltaFIFO具体实现的，DeltaFIFO的主要作用就是用来存放watch 函数返回的各种事件，其中Reflector中的watch函数监听到事件的变化后，会将对应资源变更信息存入到DeltaFIFO中，也就是说DeltaFIFO中的queue的生产者，即Reflector是DeltaFIFO的生产者。
+
+k8s.io/client-go/tools/cache/reflector.go
+
+```go
+func (r *Reflector) Run(stopCh <-chan struct{}) {
+	klog.V(3).Infof("Starting reflector %s (%s) from %s", r.expectedTypeName, r.resyncPeriod, r.name)
+	wait.BackoffUntil(func() {
+		if err := r.ListAndWatch(stopCh); err != nil {
+			r.watchErrorHandler(r, err)
+		}
+	}, r.backoffManager, true, stopCh)
+	klog.V(3).Infof("Stopping reflector %s (%s) from %s", r.expectedTypeName, r.resyncPeriod, r.name)
+}
+
+// watchHandler watches w and keeps *resourceVersion up to date.
+func (r *Reflector) watchHandler(start time.Time, w watch.Interface, resourceVersion *string, errc chan error, stopCh <-chan struct{}) error {
+	eventCount := 0
+
+	// Stopping the watcher should be idempotent and if we return from this function there's no way
+	// we're coming back in with the same watch interface.
+	defer w.Stop()
+
+loop:
+	for {
+		select {
+		case <-stopCh:
+			return errorStopRequested
+		case err := <-errc:
+			return err
+		case event, ok := <-w.ResultChan():
+			if !ok {
+				break loop
+			}
+			if event.Type == watch.Error {
+				return apierrors.FromObject(event.Object)
+			}
+			if r.expectedType != nil {
+				if e, a := r.expectedType, reflect.TypeOf(event.Object); e != a {
+					utilruntime.HandleError(fmt.Errorf("%s: expected type %v, but watch event object had type %v", r.name, e, a))
+					continue
+				}
+			}
+			if r.expectedGVK != nil {
+				if e, a := *r.expectedGVK, event.Object.GetObjectKind().GroupVersionKind(); e != a {
+					utilruntime.HandleError(fmt.Errorf("%s: expected gvk %v, but watch event object had gvk %v", r.name, e, a))
+					continue
+				}
+			}
+			meta, err := meta.Accessor(event.Object)
+			if err != nil {
+				utilruntime.HandleError(fmt.Errorf("%s: unable to understand watch event %#v", r.name, event))
+				continue
+			}
+			newResourceVersion := meta.GetResourceVersion()
+			switch event.Type {
+			case watch.Added:
+				err := r.store.Add(event.Object)
+				if err != nil {
+					utilruntime.HandleError(fmt.Errorf("%s: unable to add watch event object (%#v) to store: %v", r.name, event.Object, err))
+				}
+			case watch.Modified:
+				err := r.store.Update(event.Object)
+				if err != nil {
+					utilruntime.HandleError(fmt.Errorf("%s: unable to update watch event object (%#v) to store: %v", r.name, event.Object, err))
+				}
+			case watch.Deleted:
+				// TODO: Will any consumers need access to the "last known
+				// state", which is passed in event.Object? If so, may need
+				// to change this.
+				err := r.store.Delete(event.Object)
+				if err != nil {
+					utilruntime.HandleError(fmt.Errorf("%s: unable to delete watch event object (%#v) from store: %v", r.name, event.Object, err))
+				}
+			case watch.Bookmark:
+				// A `Bookmark` means watch has synced here, just update the resourceVersion
+			default:
+				utilruntime.HandleError(fmt.Errorf("%s: unable to understand watch event %#v", r.name, event))
+			}
+			*resourceVersion = newResourceVersion
+			r.setLastSyncResourceVersion(newResourceVersion)
+			if rvu, ok := r.store.(ResourceVersionUpdater); ok {
+				rvu.UpdateResourceVersion(newResourceVersion)
+			}
+			eventCount++
+		}
+	}
+
+	watchDuration := r.clock.Since(start)
+	if watchDuration < 1*time.Second && eventCount == 0 {
+		return fmt.Errorf("very short watch: %s: Unexpected watch close - watch lasted less than a second and no items received", r.name)
+	}
+	klog.V(4).Infof("%s: Watch close - %v total %v items received", r.name, r.expectedTypeName, eventCount)
+	return nil
+}
+```
+
+wait.Until(c.processLoop, time.Second, stopCh)的具体代码如下所示，
+
+k8s.io/client-go/tools/cache/controller.go
+
+```go
+func (c *controller) processLoop() {
+	for {
+		obj, err := c.config.Queue.Pop(PopProcessFunc(c.config.Process))
+		if err != nil {
+			if err == ErrFIFOClosed {
+				return
+			}
+			if c.config.RetryOnError {
+				// This is the safe way to re-enqueue.
+				c.config.Queue.AddIfNotPresent(obj)
+			}
+		}
+	}
+}
+```
+
+processLoop负责从DeltaFIFO取出数据并消费,**c.config.Queue.Pop()**即为DeltaFIFO pop出的的对象，交由传入的PopProcessFunc进行处理，（具体是**c.config.Process**）,即之前传入的HandlerDeltas。DeltaFIFO的Pop函数的具体实现如下所示，具体逻辑是入参中包含回调函数HandleDelta **process**，从队列中取出第一个对象，交由传入的回调函数处理**err := process(item)**。
+
+k8s.io/client-go/tools/cache/delta_fifo.go
+
+```go
+func (f *DeltaFIFO) Pop(process PopProcessFunc) (interface{}, error) {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	for {
+		for len(f.queue) == 0 {
+			// When the queue is empty, invocation of Pop() is blocked until new item is enqueued.
+			// When Close() is called, the f.closed is set and the condition is broadcasted.
+			// Which causes this loop to continue and return from the Pop().
+			if f.closed {
+				return nil, ErrFIFOClosed
+			}
+
+			f.cond.Wait()
+		}
+		id := f.queue[0]
+		f.queue = f.queue[1:]
+		if f.initialPopulationCount > 0 {
+			f.initialPopulationCount--
+		}
+		item, ok := f.items[id]
+		if !ok {
+			// This should never happen
+			klog.Errorf("Inconceivable! %q was in f.queue but not f.items; ignoring.", id)
+			continue
+		}
+		delete(f.items, id)
+		err := process(item)
+		if e, ok := err.(ErrRequeue); ok {
+			f.addIfNotPresent(id, item)
+			err = e.Err
+		}
+		// Don't need to copyDeltas here, because we're transferring
+		// ownership to the caller.
+		return item, err
+	}
+}
+```
+
+HandleDeltas的代码具体如下，核心逻辑包含以下两点
+
+- 更新本地缓存indexer，具体更新的是ThreadSafeMap
+- 将事件通知到所有的listener，其实HandleDeltas会向上文中的add_ch加入数据，即它是add_ch的生产者
+
+具体调用的是**s.indexer.Update**更新缓存，以及**distribute**通知事件，将notification通过**listener.add(obj)**加入到add_Ch
+
+k8s.io/client-go/tools/cache/shared_informer.go
+
+```go
+func (s *sharedIndexInformer) HandleDeltas(obj interface{}) error {
+	s.blockDeltas.Lock()
+	defer s.blockDeltas.Unlock()
+
+	// from oldest to newest
+	for _, d := range obj.(Deltas) {
+		switch d.Type {
+		case Sync, Replaced, Added, Updated:
+			s.cacheMutationDetector.AddObject(d.Object)
+			if old, exists, err := s.indexer.Get(d.Object); err == nil && exists {
+				if err := s.indexer.Update(d.Object); err != nil {
+					return err
+				}
+
+				isSync := false
+				switch {
+				case d.Type == Sync:
+					// Sync events are only propagated to listeners that requested resync
+					isSync = true
+				case d.Type == Replaced:
+					if accessor, err := meta.Accessor(d.Object); err == nil {
+						if oldAccessor, err := meta.Accessor(old); err == nil {
+							// Replaced events that didn't change resourceVersion are treated as resync events
+							// and only propagated to listeners that requested resync
+							isSync = accessor.GetResourceVersion() == oldAccessor.GetResourceVersion()
+						}
+					}
+				}
+				s.processor.distribute(updateNotification{oldObj: old, newObj: d.Object}, isSync)
+			} else {
+				if err := s.indexer.Add(d.Object); err != nil {
+					return err
+				}
+				s.processor.distribute(addNotification{newObj: d.Object}, false)
+			}
+		case Deleted:
+			if err := s.indexer.Delete(d.Object); err != nil {
+				return err
+			}
+			s.processor.distribute(deleteNotification{oldObj: d.Object}, false)
+		}
+	}
+	return nil
+}
+
+
+func (p *sharedProcessor) distribute(obj interface{}, sync bool) {
+	p.listenersLock.RLock()
+	defer p.listenersLock.RUnlock()
+
+	if sync {
+		for _, listener := range p.syncingListeners {
+			listener.add(obj)
+		}
+	} else {
+		for _, listener := range p.listeners {
+			listener.add(obj)
+		}
+	}
+}
+
+
+func (p *processorListener) add(notification interface{}) {
+	p.addCh <- notification
 }
 ```
 
