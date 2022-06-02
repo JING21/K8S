@@ -2271,5 +2271,9 @@ func (p *processorListener) add(notification interface{}) {
 }
 ```
 
+#### demo Code逻辑调用关系图
 
+demo Code具体调用的函数逻辑关系图如下所示，可以更好的理解client-go具体的调用逻辑
+
+![client-go logical structure](https://github.com/JING21/K8S/raw/main/client-go/client-go logical structure.jpg)
 
