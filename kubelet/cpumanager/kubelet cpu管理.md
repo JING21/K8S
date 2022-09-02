@@ -1,5 +1,3 @@
-[TOC]
-
 # Kubelet cpu绑核功能 
 
 ## 背景
