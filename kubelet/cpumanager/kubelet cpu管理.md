@@ -771,7 +771,7 @@ func (p *nonePolicy) GetAllocatableCPUs(m state.State) cpuset.CPUSet {
 
 而Static Policy首先在创建CPUManager的时候就会进行校验，首先根据cadvisor取到的machineInfo（节点信息），根据**topology.Dicsovery(machineInfo)**可以生成具体的cpu拓扑信息,包含了节点cpu逻辑核数，物理核数和cpu socket数
 
-![image-20220809155145496](/Users/jing/Desktop/topo.png)
+![image-20220809155145496](https://github.com/JING21/K8S/raw/main/kubelet/cpumanager/topo.png)
 
 pkg/kubelet/cm/cpumanager/topology/topology.go
 
